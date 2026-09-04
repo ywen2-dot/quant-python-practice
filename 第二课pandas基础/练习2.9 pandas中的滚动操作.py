@@ -1,0 +1,22 @@
+import pandas as pd
+pd.set_option('expand_frame_repr',False)
+df=pd.read_excel(
+    'sh600000_近三年日行情.xlsx'
+)
+print(df['收盘价'].mean())
+#如何得到最近三天收盘价的平均值
+#使用rolling函数
+df['收盘价_3天均值']=df['收盘价'].rolling(3).mean()
+print(df)
+#得到最近三天的最大值
+df['收盘价_3天最大值']=df['收盘价'].rolling(3).max()
+print(df)
+#最小值
+df['收盘价_3天最小值']=df['收盘价'].rolling(3).min()
+print(df)
+#计算每一天收盘价到现在的均值
+df['收盘价_至今均值']=df['收盘价'].expanding().mean()
+#计算每一天收盘价到现在的最大值
+df['收盘价_最大值']=df['收盘价'].expanding().max()
+#输出这份文件
+df.to_csv('output.csv',index=False)

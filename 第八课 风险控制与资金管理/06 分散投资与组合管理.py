@@ -1,0 +1,34 @@
+initial_capital=100000
+#三只股票各使用帐户资金的20%
+weight_a=0.2
+weight_b=0.2
+weight_c=0.2
+#计算总仓位与保留现金
+invested_weight=weight_a+weight_b+weight_c
+remain_weight=1-invested_weight
+#防止仓位超过百分之百
+if invested_weight>1:
+    raise ValueError('总仓位不能超过百分之百')
+#假设这一段时间的股票的涨跌幅
+return_a=0.1
+return_b=-0.05
+return_c=0.0
+#分别投入每只股票的资金
+capital_a=initial_capital*weight_a
+capital_b=initial_capital*weight_b
+capital_c=initial_capital*weight_c
+#分别计算三只股票赚或者亏的钱
+profit_a=capital_a*return_a
+profit_b=capital_b*return_b
+profit_c=capital_c*return_c
+#组合总盈亏，组合收益率，期末资金
+portfolio_profit=profit_a+profit_b+profit_c
+portfolio_return=portfolio_profit/initial_capital
+final_capital=initial_capital+portfolio_profit
+#打印结果
+print(f'初始资金：{initial_capital:,.2f}')
+print(f'股票总仓位：{invested_weight:.2f}')
+print(f'剩余仓位：{remain_weight:.2f}')
+print(f'组合盈亏：{initial_capital:.2f}')
+print(f'组合收益率：{portfolio_profit:.2f}')
+print(f'期末资金：{final_capital:.2f}')

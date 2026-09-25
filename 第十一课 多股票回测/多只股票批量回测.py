@@ -1,0 +1,467 @@
+import pandas as pd
+from sqlalchemy import create_engine
+from sympy.physics.units import amount
+import numpy as np
+pd.set_option('expand_frame_repr', False)
+#======参数设置======
+initial_capital=100000.0
+#每次买入最多初始资金的百分之10，包含买入费用
+position_size_rate=0.1
+#最多同时持有3只股票
+max_position=3
+#简化费用：手续费
+fee_rate=0.0005
+#买入股数按100股取整
+lot_size=100
+#确认zagzig的幅度
+zigzag_rate=0.09
+#准备信号的有效窗口
+setup_valid_days=10
+#最近多少个交易日出现过MACD金叉
+macd_valid_days=10
+#布林带的宽度
+bb_std_multiple=0.5
+#同一天买入信号过多时，优先处理排在前面的股票
+stock_list = [
+    "sh600000",
+    "sh600004",
+    "sh600006",
+    "sh600007",
+    "sh600008",
+    "sh600009",
+    "sh600016",
+    "sh600030",
+    "sh600276",
+    "sh600519",
+]
+#创建连接数据库
+engine=create_engine('sqlite:////Users/yuhanwen/Desktop/量化交易/yfinance crash course/量化入门/1.Python股票量化投资系统课程/第四课 构建自己的股票数据库/stock.db')
+def prepare_stock_data(target_stock):
+    df = pd.read_sql(
+        f"""
+        SELECT *
+        FROM stock_500_daily
+        WHERE 股票代码 = '{target_stock}'
+        """,
+        engine,
+    )
+    if df.empty:
+        raise ValueError("没有找到这只股票")
+    #吧数据库中的中文列改名为程序使用的英文列名字
+    df=df.rename(columns={
+        '股票代码':'code',
+        '股票名称':'name',
+        '交易日期':'date',
+        '开盘价':'open',
+        '最高价':'high',
+        '最低价':'low',
+        '收盘价':'close',
+        '成交量':'volume',
+        '前收盘价':'pre_close',
+        '成交额':'deal_volume',
+    })
+    #无法识别的日期转换为缺失值
+    df["date"] = pd.to_datetime(
+        df["date"],
+        errors="coerce",
+    )
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+
+    # 把价格和成交量转换为数值
+    df[numeric_columns] = df[numeric_columns].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    # 删除关键数据缺失的记录
+    df = df.dropna(
+        subset=["date", *numeric_columns]
+    )
+    # 一个交易日只保留一条记录
+    df = df.drop_duplicates(
+        subset="date",
+        keep="last",
+    )
+    # 按日期从早到晚排列
+    df = df.sort_values("date")
+    df = df.reset_index(drop=True)
+    #========计算MACD=======
+    df['EM12']=df['close'].ewm(span=12,adjust=False).mean()
+    df['EM26']=df['close'].ewm(span=26,adjust=False).mean()
+    df['DIF']=df['EM12']-df['EM26']
+    df['DEA']=df['DIF'].ewm(span=9,adjust=False).mean()
+    df['MACD']=2*(df['DIF']-df['DEA'])
+    #========计算布林带=======
+    # 得到中轨
+    df['BB_middle'] = df['close'].rolling(20).mean()
+    # 标准差：衡量价格有多分散
+    df['BB_std'] = df['close'].rolling(20).std()
+    # 计算上轨和下轨
+    df['BB_upper'] = df['BB_middle'] + bb_std_multiple * df['BB_std']
+    df['BB_lower'] = df['BB_middle'] - bb_std_multiple* df['BB_std']
+
+
+    #========MACD条件=========
+    #DIF在DEA上方
+    df['macd_above']=df['DIF']>df['DEA']
+    df['macd_low_strong']=df['macd_above']&(df['DIF']<0)
+    #上一个交易日DIF是否在DEA的上方
+    df['macd_above_yesterday']=df['macd_above'].shift(1,fill_value=False)
+    #昨天不在上方，今天在上方表示出现金叉
+    df['macd_buy_signal']=df['macd_above']&(df['macd_above_yesterday']==False)
+    #包含当天，最近10个交易日是否出现过金叉
+    df['macd_buy_recent']=df['macd_buy_signal'].rolling(macd_valid_days,min_periods=1).max().astype(bool)
+    #=========布林带条件========
+    #收盘在上轨之上
+    df['bb_buy_signal']=(df['close']>df['BB_upper'])&(df['close'].shift(1)<=df['BB_upper'].shift(1))
+    df['bb_sell_signal']=(df['close']<df['BB_lower'])&(df['close'].shift(1)>=df['BB_lower'].shift(1))
+    df['sell_signal']=df['bb_sell_signal']
+    #==========zagzig确认信号==========
+    df['zigzag_buy_signal']=False
+    #0初始方向为确定
+    #1 上升波段 寻找最高点
+    #-1 下降波段，寻找最低点
+    direction=0
+    highest_price=float(df.at[0,'close'])
+    lowest_price=float(df.at[0,'close'])
+    for i in range(1,len(df)):
+        close_price=float(df.at[i,'close'])
+        if direction==0:
+            highest_price=max(highest_price,close_price)
+            lowest_price=min(lowest_price,close_price)
+            rise_from_low=close_price/lowest_price-1
+            fall_from_high=close_price/highest_price-1
+            if rise_from_low>=zigzag_rate:
+                df.at[i,'zigzag_buy_signal']=True
+                direction=1
+                highest_price=close_price
+            elif fall_from_high<=-zigzag_rate:
+                direction=-1
+                lowest_price=close_price
+        elif direction==1:
+            highest_price=max(highest_price,close_price)
+            fall_from_high=close_price/highest_price-1
+            if fall_from_high<=-zigzag_rate:
+                direction=-1
+                lowest_price=close_price
+        elif direction == -1:
+            lowest_price = min(lowest_price, close_price)
+            rise_from_low = close_price / lowest_price - 1
+            if rise_from_low >= zigzag_rate:
+                df.at[i, "zigzag_buy_signal"] = True
+                direction = 1
+                highest_price = close_price
+#=========组合信号===========
+    #最近的窗口内是否出现过低点确认信号
+    df['zigzag_low_signal']=df['zigzag_buy_signal'].rolling(setup_valid_days,min_periods=1).max().astype(bool)
+    #低点确认后，MACD满足零轴下方强势条件
+    df['long_setup_signal']=df['zigzag_low_signal']&df['macd_low_strong']
+    #准备阶段红折线出现后附图MACD强势可以持续即可
+    df['long_setup_recent']=df['long_setup_signal'].rolling(setup_valid_days,min_periods=1).max().astype(bool)
+    # 保留原来的组合买入条件
+    df["buy_signal"] = (df["long_setup_recent"]& df["macd_buy_recent"]& df["bb_buy_signal"])
+    #=====次日高开确认
+    #当前日期的前一天的收盘价
+    df['previous_close']=df['close'].shift(1)
+    #昨天收盘是否产生买入卖出信号
+    yesterday_buy_signal=df['buy_signal'].shift(1,fill_value=False)
+    yesterday_sell_signal=df['sell_signal'].shift(1,fill_value=False)
+    #昨天有收盘信号并且高开才买入
+    df['buy_signal_for_today']=yesterday_buy_signal&(df['open']>df['previous_close'])
+    #卖出
+    df['sell_signal_for_today']=yesterday_sell_signal&(df['open']<df['previous_close'])
+    # 删除数据不足的行
+    df = df.dropna(
+        subset=["BB_middle", "BB_upper", "BB_lower"]
+    ).copy()
+    df=df.set_index('date')
+    return df
+#=========准备所有股票的数据===========
+stock_data={}
+try:
+    for stock_code in stock_list:
+        stock_df = prepare_stock_data(stock_code)
+        stock_data[stock_code]=stock_df#把数据保存到字典中
+    print(
+        f"数据准备完成：{stock_code}, "
+        f"共{len(stock_df)}行"
+    )
+finally:
+    engine.dispose()
+#========统一回测==========
+#找到所有股票共同覆盖的日期范围
+start_date=max(df.index.min() for df in stock_data.values())
+#找到最晚的日期
+end_date = min(df.index.max() for df in stock_data.values())
+#检查日期是否有效
+if start_date>end_date:
+    raise ValueError('这写股票没有共同的数据覆盖')
+#收集回测日期
+all_dates=set()
+for stock_df in stock_data.values():
+    #收集共同区间内出现的日期
+    dates=stock_df.loc[start_date:end_date].index
+    all_dates.update(dates)
+#日期去重后，从早到晚排列
+all_dates=sorted(all_dates)
+if not all_dates:
+    raise ValueError('回测区间内没有可交易的日期')
+#=======统一账户========
+cash=initial_capital
+#持仓
+positions={}
+#保存持仓股票最近已知的收盘价
+last_price={}
+#记录交易
+trade_records=[]
+#保存每日账户资产
+portfolio_records=[]
+#每次建仓后的股票预算
+position_budget=initial_capital*position_size_rate
+#=========按日期执行组合交易========
+for current_date in all_dates:
+    #当前日期实际存在的行情
+    today_rows={}
+    for stock_code in stock_list:
+        stock_df = stock_data[stock_code]
+        if current_date in stock_df.index:
+            today_rows[stock_code]=stock_df.loc[current_date]
+    #记录今天卖出的股票，避免当天又买回来
+    sold_today=set()
+    #=======遍历当前持仓
+    for stock_code in list(positions):
+        if stock_code not in today_rows:
+            continue
+        #取出行情跟持仓信息
+        row=today_rows[stock_code]
+        holding=positions[stock_code]
+        #当天没有卖出信息
+        if not bool(row['sell_signal_for_today']):
+            continue
+        #买入当日不允许卖出
+        if current_date<=holding['buy_date']:
+            continue
+        #取得当天的开盘价
+        sell_price=float(row['open'])
+        #检查卖出价是否有效
+        if sell_price<=0:
+            continue
+        #取出持有股数
+        shares=holding['shares']
+        #计算卖出金额
+        amount=shares*sell_price
+        fee=amount*fee_rate
+        #卖出后现金增加
+        cash +=amount-fee
+        #保存卖出记录
+        trade_records.append(
+            {
+                "date": current_date,
+                'code': stock_code,
+                'name':row['name'],
+                'action': 'sell',
+                'price': sell_price,
+                'shares': shares,
+                'amount': amount,
+                'fee': fee,
+                'cash_after': cash,
+            }
+        )
+        # 删除这只股票的持仓
+        del positions[stock_code]
+        sold_today.add(stock_code)
+#========再检查有没有需要买入的股票=========
+    for stock_code in stock_list:
+        if len(positions)>=max_position:
+            break
+        #已经持有就不重复买入
+        if stock_code in positions:
+            continue
+        #今天刚刚卖出，今天不再买入
+        if stock_code in sold_today:
+            continue
+        #今天没有行情
+        if stock_code not in today_rows:
+            continue
+        row=today_rows[stock_code]
+        #判断今天有信号是否高开并且可以买入
+        if not bool(row['buy_signal_for_today']):
+            continue
+        #确定买入价格
+        buy_price=float(row['open'])
+        #检查买入价格
+        if buy_price<=0:
+            continue
+        #计算可以买多少
+        budget=min(position_budget,cash)
+        #计算购买一手股票需要的总资金
+        one_lot_cost=(buy_price*lot_size*(1+fee_rate))
+        #只能购买完整的手数
+        lots=int(budget//one_lot_cost)
+        #连一手都买不起
+        if lots<1:
+            continue
+        shares=lots*lot_size
+        amount=shares*buy_price
+        fee=amount*fee_rate
+        total_cost=amount+fee
+        #扣除买入成本
+        cash -= total_cost
+        positions[stock_code]={
+            'shares': shares,
+            'buy_date': current_date,
+        }
+        #保存买入记录
+        trade_records.append(
+            {
+                "date": current_date,
+                'code': stock_code,
+                'name':row['name'],
+                'action': 'buy',
+                'price': buy_price,
+                'shares': shares,
+                'amount': amount,
+                'fee': fee,
+                'cash_after': cash,
+            }
+        )
+        #收盘后更新价格
+    for stock_code,row in today_rows.items():
+        last_price[stock_code]=float(row['close'])
+    stock_value=0.0
+    #计算持仓股票的市值
+    for stock_code,holding in positions.items():
+        #检查有没有价格
+        if stock_code not in last_price:
+            continue
+        close_price=last_price[stock_code]
+        stock_value+=(holding['shares']*close_price)
+    #计算帐户总资产
+    total_value=cash+stock_value
+    #保存当天帐户情况
+    portfolio_records.append(
+        {
+            "date": current_date,
+            'cash': cash,
+            'stock_value': stock_value,
+            'total_value': total_value,
+            'positions_count': len(positions),
+        }
+    )
+#=======整理回测结果=========
+portfolio_df=pd.DataFrame(portfolio_records)
+portfolio_df = portfolio_df.set_index("date")
+portfolio_df['equity']=(portfolio_df['total_value']/initial_capital)
+#计算每日收益率
+portfolio_df['daily_return']=(portfolio_df['total_value'].pct_change())
+first_date = portfolio_df.index[0]
+portfolio_df.loc[first_date, "daily_return"] = (
+    portfolio_df["total_value"].iloc[0] / initial_capital - 1
+)
+#计算历史最高净值
+portfolio_df['running_max']=(portfolio_df['equity'].cummax().clip(lower=1.0))
+#计算回撤
+portfolio_df['drawdown']=(portfolio_df['equity']/portfolio_df['running_max'])-1
+#计算最终资产和总收益率
+print("当前持仓：", positions)
+print("最近价格：", last_price)
+
+bad_rows = portfolio_df[
+    portfolio_df[
+        ["cash", "stock_value", "total_value"]
+    ].isna().any(axis=1)
+]
+
+print("出现缺失值的账户记录：")
+print(bad_rows)
+final_capital = float(portfolio_df["total_value"].iloc[-1])
+total_return = (final_capital / initial_capital - 1)
+#最大回撤
+max_drawdown = float(portfolio_df["drawdown"].min())
+trading_days = len(portfolio_df)
+#计算年度收益率
+annual_return = ((final_capital / initial_capital)** (252 / trading_days)- 1)
+#平均每日收益率和波动率
+daily_mean = (portfolio_df["daily_return"].mean())
+daily_std = (portfolio_df["daily_return"].std())
+#年度波动率
+annual_volatility = (daily_std * np.sqrt(252))
+#计算夏普比率
+sharpe_ratio = (daily_mean*np.sqrt(252)/daily_std) if daily_std!=0 else 0
+# ==================== 10. 输出交易记录 ====================
+
+trade_df = pd.DataFrame(
+    trade_records,
+    columns=[
+        "date",
+        "code",
+        "name",
+        "action",
+        "price",
+        "shares",
+        "amount",
+        "fee",
+        "cash_after",
+    ],
+)
+
+buy_count = int(
+    (trade_df["action"] == "buy").sum()
+)
+
+sell_count = int(
+    (trade_df["action"] == "sell").sum()
+)
+
+total_fees = float(
+    trade_df["fee"].sum()
+)
+
+print("\n========== 组合成交记录 ==========")
+
+if trade_df.empty:
+    print("本次回测没有成交")
+else:
+    print(
+        trade_df.to_string(
+            index=False,
+            float_format=lambda value: (
+                f"{value:.2f}"
+            ),
+        )
+    )
+
+# ==================== 11. 输出回测结果 ====================
+
+
+print(f"回测交易日：{trading_days}")
+print(f"股票池数量：{len(stock_list)}")
+print(f"最多同时持仓：{max_position}")
+print(f"每次买入预算：{position_budget:,.2f} 元")
+print(f"初始资金：{initial_capital:,.2f} 元")
+print(f"最终总资产：{final_capital:,.2f} 元")
+print(f"最终现金：{cash:,.2f} 元")
+
+print(
+    f"最终股票市值："
+    f"{portfolio_df['stock_value'].iloc[-1]:,.2f} 元"
+)
+
+print(f"总收益率：{total_return:.2%}")
+print(f"年化收益率：{annual_return:.2%}")
+print(f"年化波动率：{annual_volatility:.2%}")
+print(f"夏普比率：{sharpe_ratio:.2f}")
+print(f"最大回撤：{max_drawdown:.2%}")
+print(f"买入次数：{buy_count}")
+print(f"卖出次数：{sell_count}")
+print(f"累计手续费：{total_fees:,.2f} 元")
+
+
+
+
+
